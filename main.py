@@ -1,26 +1,27 @@
 import os
 import json
-import numpy as np
+import uuid
 from typing import List, Dict, Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import openai
-import faiss
+import chromadb
+from chromadb.config import Settings
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Initialize FastAPI app
-app = FastAPI(title="E-commerce FAQ RAG Chatbot", version="1.0.0")
+app = FastAPI(title="E-commerce FAQ RAG Chatbot with ChromaDB", version="1.0.0")
 
 # Initialize OpenAI client with your API key
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Global variables to store our data
-vector_store = None
+chroma_client = None
+collection = None
 faq_chunks = []
-embeddings_cache = []
 
 # Define the request format that frontend will send
 class QueryRequest(BaseModel):
@@ -35,28 +36,53 @@ class QueryResponse(BaseModel):
     confidence: float
     status: str
 
-class RAGChatbot:
+class ChromaRAGChatbot:
     def __init__(self):
-        self.embedding_model = "text-embedding-3-small"  # OpenAI embedding model
         self.chat_model = "gpt-4o-mini"  # OpenAI chat model (good for Arabic)
-        self.chunk_size = 500
-        self.overlap = 50
+        self.collection_name = "faq_collection"
         
+    def initialize_chromadb(self):
+        """Initialize ChromaDB client and collection."""
+        try:
+            # Initialize ChromaDB client (persistent storage)
+            self.chroma_client = chromadb.PersistentClient(
+                path="./chroma_db",  # This will create a local database
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
+            
+            # Create or get collection with OpenAI embeddings
+            self.collection = self.chroma_client.get_or_create_collection(
+                name=self.collection_name,
+                embedding_function=chromadb.utils.embedding_functions.OpenAIEmbeddingFunction(
+                    api_key=os.getenv("OPENAI_API_KEY"),
+                    model_name="text-embedding-3-small"
+                ),
+                metadata={"hnsw:space": "cosine"}  # Use cosine similarity
+            )
+            
+            return self.chroma_client, self.collection
+            
+        except Exception as e:
+            raise Exception(f"Error initializing ChromaDB: {str(e)}")
+    
     def load_markdown_file(self, file_path: str) -> List[Dict[str, Any]]:
         """Load and parse your FAQ markdown file into chunks."""
         try:
             with open(file_path, 'r', encoding='utf-8') as file:
                 content = file.read()
             
-            # Split content into Q&A pairs based on ## headers
+            # Split content into Q&A pairs based on ### headers
             chunks = []
-            sections = content.split('\n##')  # Split by ## which marks questions
+            sections = content.split('\n###')  # Split by ### which marks questions
             
             for i, section in enumerate(sections):
                 if section.strip():
                     # Clean up section
-                    if not section.startswith('##'):
-                        section = '##' + section
+                    if not section.startswith('###'):
+                        section = '###' + section
                     
                     lines = section.strip().split('\n')
                     if len(lines) >= 2:
@@ -68,7 +94,7 @@ class RAGChatbot:
                             'question': question,
                             'answer': answer,
                             'content': f"السؤال: {question}\nالجواب: {answer}",
-                            'metadata': {'type': 'faq', 'index': i}
+                            'metadata': {'type': 'faq', 'index': i, 'question': question}
                         })
             
             return chunks
@@ -76,66 +102,72 @@ class RAGChatbot:
         except Exception as e:
             raise Exception(f"Error loading markdown file: {str(e)}")
     
-    def get_embeddings(self, texts: List[str]) -> np.ndarray:
-        """Generate embeddings using OpenAI API."""
+    def add_documents_to_chroma(self, chunks: List[Dict[str, Any]]):
+        """Add FAQ chunks to ChromaDB collection."""
         try:
-            response = client.embeddings.create(
-                model=self.embedding_model,
-                input=texts
+            # Check if collection already has documents
+            collection_count = self.collection.count()
+            if collection_count > 0:
+                print(f"Collection already contains {collection_count} documents. Skipping...")
+                return
+            
+            # Prepare data for ChromaDB
+            documents = []
+            metadatas = []
+            ids = []
+            
+            for chunk in chunks:
+                documents.append(chunk['content'])
+                metadatas.append({
+                    'question': chunk['question'],
+                    'answer': chunk['answer'],
+                    'type': chunk['metadata']['type'],
+                    'index': chunk['metadata']['index']
+                })
+                ids.append(chunk['id'])
+            
+            # Add documents to collection (ChromaDB will handle embeddings automatically)
+            self.collection.add(
+                documents=documents,
+                metadatas=metadatas,
+                ids=ids
             )
             
-            embeddings = [item.embedding for item in response.data]
-            return np.array(embeddings, dtype=np.float32)
+            print(f"Added {len(documents)} documents to ChromaDB collection")
             
         except Exception as e:
-            raise Exception(f"Error generating embeddings: {str(e)}")
+            raise Exception(f"Error adding documents to ChromaDB: {str(e)}")
     
-    def create_vector_store(self, chunks: List[Dict[str, Any]]) -> faiss.Index:
-        """Create FAISS vector store from FAQ chunks."""
+    def search_similar(self, query: str, n_results: int = 3) -> List[Dict[str, Any]]:
+        """Search for similar FAQ entries using ChromaDB."""
         try:
-            # Extract content for embedding
-            texts = [chunk['content'] for chunk in chunks]
+            # Query the collection
+            results = self.collection.query(
+                query_texts=[query],
+                n_results=n_results,
+                include=['documents', 'metadatas', 'distances']
+            )
             
-            # Generate embeddings using OpenAI
-            embeddings = self.get_embeddings(texts)
-            
-            # Create FAISS index for similarity search
-            dimension = embeddings.shape[1]
-            index = faiss.IndexFlatIP(dimension)  # Inner product for similarity
-            
-            # Normalize embeddings for cosine similarity
-            faiss.normalize_L2(embeddings)
-            index.add(embeddings)
-            
-            return index, embeddings
-            
-        except Exception as e:
-            raise Exception(f"Error creating vector store: {str(e)}")
-    
-    def search_similar(self, query: str, k: int = 3) -> List[Dict[str, Any]]:
-        """Search for similar FAQ entries to the user's question."""
-        try:
-            # Generate embedding for user's question
-            query_embedding = self.get_embeddings([query])
-            faiss.normalize_L2(query_embedding)
-            
-            # Search in vector store
-            scores, indices = vector_store.search(query_embedding, k)
-            
-            # Prepare results
-            results = []
-            for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
-                if idx != -1:  # Valid index
-                    chunk = faq_chunks[idx]
-                    results.append({
-                        'content': chunk['content'],
-                        'question': chunk['question'],
-                        'answer': chunk['answer'],
-                        'score': float(score),
-                        'metadata': chunk['metadata']
+            # Process results
+            similar_chunks = []
+            if results['documents'] and results['documents'][0]:
+                for i, (doc, metadata, distance) in enumerate(zip(
+                    results['documents'][0],
+                    results['metadatas'][0],
+                    results['distances'][0]
+                )):
+                    # Convert distance to similarity score (ChromaDB returns distances, lower = more similar)
+                    similarity_score = max(0, 1 - distance)  # Convert distance to similarity
+                    
+                    similar_chunks.append({
+                        'content': doc,
+                        'question': metadata['question'],
+                        'answer': metadata['answer'],
+                        'score': similarity_score,
+                        'metadata': metadata
                     })
             
-            return results
+            return similar_chunks
             
         except Exception as e:
             raise Exception(f"Error searching similar content: {str(e)}")
@@ -177,8 +209,11 @@ class RAGChatbot:
             answer = response.choices[0].message.content
             
             # Calculate confidence based on similarity scores
-            avg_score = np.mean([chunk['score'] for chunk in context_chunks]) if context_chunks else 0
-            confidence = min(avg_score * 100, 95)  # Cap at 95%
+            if context_chunks:
+                avg_score = sum(chunk['score'] for chunk in context_chunks) / len(context_chunks)
+                confidence = min(avg_score * 100, 95)  # Cap at 95%
+            else:
+                confidence = 0
             
             return {
                 'answer': answer,
@@ -197,23 +232,29 @@ class RAGChatbot:
             }
 
 # Initialize the chatbot
-rag_chatbot = RAGChatbot()
+rag_chatbot = ChromaRAGChatbot()
 
 @app.on_event("startup")
 async def load_faq_data():
     """This runs when the server starts - loads your FAQ data."""
-    global vector_store, faq_chunks, embeddings_cache
+    global chroma_client, collection, faq_chunks
     
     try:
+        print("Initializing ChromaDB...")
+        
+        # Initialize ChromaDB
+        chroma_client, collection = rag_chatbot.initialize_chromadb()
+        
         print("Loading FAQ data...")
         
         # Load FAQ chunks from your markdown file
         faq_chunks = rag_chatbot.load_markdown_file("faq.md")
         print(f"Loaded {len(faq_chunks)} FAQ entries")
         
-        # Create vector store for similarity search
-        vector_store, embeddings_cache = rag_chatbot.create_vector_store(faq_chunks)
-        print("Vector store created successfully")
+        # Add documents to ChromaDB collection
+        rag_chatbot.add_documents_to_chroma(faq_chunks)
+        
+        print("ChromaDB setup completed successfully")
         
     except Exception as e:
         print(f"Error loading FAQ data: {str(e)}")
@@ -222,10 +263,12 @@ async def load_faq_data():
 @app.get("/")
 async def root():
     """Health check endpoint - test if server is running."""
+    collection_count = collection.count() if collection else 0
     return {
-        "message": "E-commerce FAQ RAG Chatbot API",
+        "message": "E-commerce FAQ RAG Chatbot API with ChromaDB",
         "status": "running",
-        "faq_entries": len(faq_chunks) if faq_chunks else 0
+        "faq_entries": len(faq_chunks) if faq_chunks else 0,
+        "chromadb_documents": collection_count
     }
 
 @app.post("/ask", response_model=QueryResponse)
@@ -235,13 +278,13 @@ async def ask_question(request: QueryRequest):
         if not request.question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
         
-        if not vector_store or not faq_chunks:
+        if not collection or not faq_chunks:
             raise HTTPException(status_code=503, detail="FAQ data not loaded")
         
-        # Search for relevant FAQ entries
+        # Search for relevant FAQ entries using ChromaDB
         similar_chunks = rag_chatbot.search_similar(
             request.question, 
-            k=request.max_results
+            n_results=request.max_results
         )
         
         if not similar_chunks:
@@ -270,6 +313,7 @@ async def list_faq():
     
     return {
         "total": len(faq_chunks),
+        "chromadb_count": collection.count() if collection else 0,
         "entries": [
             {
                 "id": chunk["id"],
@@ -283,19 +327,51 @@ async def list_faq():
 @app.post("/faq/reload")
 async def reload_faq():
     """Reload FAQ data without restarting server."""
-    global vector_store, faq_chunks, embeddings_cache
+    global faq_chunks
     
     try:
+        # Clear existing collection
+        if collection:
+            collection.delete()
+        
+        # Reinitialize
+        chroma_client, collection = rag_chatbot.initialize_chromadb()
+        
+        # Reload FAQ data
         faq_chunks = rag_chatbot.load_markdown_file("faq.md")
-        vector_store, embeddings_cache = rag_chatbot.create_vector_store(faq_chunks)
+        rag_chatbot.add_documents_to_chroma(faq_chunks)
         
         return {
             "message": "FAQ data reloaded successfully",
-            "entries_loaded": len(faq_chunks)
+            "entries_loaded": len(faq_chunks),
+            "chromadb_documents": collection.count()
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reloading FAQ: {str(e)}")
+
+@app.get("/chromadb/stats")
+async def chromadb_stats():
+    """Get ChromaDB collection statistics."""
+    if not collection:
+        raise HTTPException(status_code=503, detail="ChromaDB not initialized")
+    
+    try:
+        # Get collection info
+        collection_count = collection.count()
+        
+        # Get sample documents
+        sample_results = collection.peek(limit=3)
+        
+        return {
+            "collection_name": rag_chatbot.collection_name,
+            "document_count": collection_count,
+            "sample_documents": sample_results.get('documents', [])[:3] if sample_results else [],
+            "embedding_function": "OpenAI text-embedding-3-small"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting ChromaDB stats: {str(e)}")
 
 # Run the server
 if __name__ == "__main__":
