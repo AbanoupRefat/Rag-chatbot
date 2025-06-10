@@ -3,6 +3,4 @@ uvicorn
 openai
 python-multipart
 chromadb==0.4.15
-numpy==1.24.3
-python-dotenv
-pydantic
+numpy>=1.26.0
